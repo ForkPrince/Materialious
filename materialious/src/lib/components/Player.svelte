@@ -1,126 +1,110 @@
 <script lang="ts">
-	import 'vidstack/bundle';
-
 	import { page } from '$app/stores';
+	import '$lib/css/shaka-player-theme.css';
 	import { getBestThumbnail } from '$lib/images';
 	import { padTime, videoLength } from '$lib/time';
 	import { Capacitor } from '@capacitor/core';
 	import { ScreenOrientation, type ScreenOrientationResult } from '@capacitor/screen-orientation';
 	import { StatusBar, Style } from '@capacitor/status-bar';
 	import { NavigationBar } from '@hugotomazi/capacitor-navigation-bar';
-	import { AudioPlayer } from '@mediagrid/capacitor-native-audio';
-	import type { Page } from '@sveltejs/kit';
+	import { type Page } from '@sveltejs/kit';
+	import { GoogleVideo, Protos } from 'googlevideo';
+	import ISO6391 from 'iso-639-1';
+	import Mousetrap from 'mousetrap';
+	import 'shaka-player/dist/controls.css';
+	import shaka from 'shaka-player/dist/shaka-player.ui';
 	import { SponsorBlock, type Category, type Segment } from 'sponsorblock-api';
 	import { onDestroy, onMount } from 'svelte';
 	import { _ } from 'svelte-i18n';
 	import { get } from 'svelte/store';
-	import type { FullscreenChangeEvent, MediaTimeUpdateEvent, PlayerSrc } from 'vidstack';
-	import type { MediaPlayerElement } from 'vidstack/elements';
 	import { deleteVideoProgress, getVideoProgress, saveVideoProgress } from '../api';
 	import type { VideoPlay } from '../api/model';
-	import { proxyVideoUrl, pullBitratePreference, type PhasedDescription } from '../misc';
+	import { type PhasedDescription } from '../misc';
 	import {
 		authStore,
 		instanceStore,
-		playerAlwaysLoopStore,
-		playerAndroidBgPlayer,
 		playerAndroidLockOrientation,
 		playerAutoPlayStore,
 		playerDefaultLanguage,
 		playerProxyVideosStore,
 		playerSavePlaybackPositionStore,
-		silenceSkipperStore,
+		poTokenCacheStore,
 		sponsorBlockCategoriesStore,
 		sponsorBlockDisplayToastStore,
 		sponsorBlockStore,
-		sponsorBlockTimelineStore,
 		sponsorBlockUrlStore,
 		synciousInstanceStore,
 		synciousStore
 	} from '../store';
-	import { getDynamicTheme, setStatusBarColor } from '../theme';
+	import { setStatusBarColor } from '../theme';
 
 	interface Props {
 		data: { video: VideoPlay; content: PhasedDescription; playlistId: string | null };
-		audioMode?: boolean;
-		player: MediaPlayerElement;
 		isSyncing?: boolean;
 		isEmbed?: boolean;
 		segments?: Segment[];
+		playerElement: HTMLMediaElement;
 	}
 
 	let {
 		data,
-		audioMode = false,
-		player = $bindable(),
-		isSyncing = false,
 		isEmbed = false,
-		segments = $bindable([])
+		segments = $bindable([]),
+		playerElement = $bindable()
 	}: Props = $props();
 
-	let src: PlayerSrc = $state([]);
 	let snackBarAlert = $state('');
-	let playerIsLive = $state(false);
 	let playerPosSet = false;
-
-	let userVideoSpeed = 1;
-	let silenceIsFastForwarding = false;
-
-	let silenceSkipperInterval: NodeJS.Timeout;
-
 	let originalOrigination: ScreenOrientationResult | undefined;
-
-	let sponsorBlockElements: Element[] = [];
-
 	let watchProgressTimeout: NodeJS.Timeout;
 
-	function setSponsorTimeline() {
-		if (get(sponsorBlockTimelineStore)) return;
-		if (segments.length === 0) return;
+	let player: shaka.Player;
+	let shakaUi: shaka.ui.Overlay;
 
-		const timeline = document.getElementsByClassName('vds-time-slider')[0];
+	const STORAGE_KEY_QUALITY = 'shaka-preferred-quality';
+	const STORAGE_KEY_VOLUME = 'shaka-preferred-volume';
 
-		if (sponsorBlockElements.length > 0) {
-			sponsorBlockElements.forEach((barDiv) => {
-				if (timeline.contains(barDiv)) {
-					timeline.removeChild(barDiv);
-				}
-			});
+	function saveQualityPreference() {
+		const tracks = player.getVariantTracks();
+		const selectedTrack = tracks.find((track) => track.active);
+		if (selectedTrack) {
+			localStorage.setItem(STORAGE_KEY_QUALITY, selectedTrack.bandwidth.toString());
 		}
+	}
 
-		const segmentColors = {
-			sponsor: '00d400',
-			selfpromo: 'ffff00',
-			interaction: 'cc00ff',
-			intro: '00ffff',
-			outro: '0202ed',
-			preview: '008fd6',
-			music_offtopic: 'ff9900',
-			filler: '7300FF'
-		};
+	function saveVolumePreference() {
+		localStorage.setItem(STORAGE_KEY_VOLUME, playerElement.volume.toString());
+	}
 
-		segments.forEach((segment) => {
-			const startPercent = (segment.startTime / data.video.lengthSeconds) * 100;
-			const endPercent = (segment.endTime / data.video.lengthSeconds) * 100;
-			const widthPercent = endPercent - startPercent;
+	function restoreQualityPreference() {
+		const savedQuality =
+			localStorage.getItem(STORAGE_KEY_QUALITY) ??
+			(import.meta.env.VITE_DEFAULT_DASH_BITRATE as string | undefined);
 
-			const barDiv = document.createElement('div');
-			barDiv.classList.add('sponsorskip-bar');
-			barDiv.style.left = `${startPercent}%`;
-			barDiv.style.width = `${widthPercent}%`;
-			barDiv.style.backgroundColor =
-				segment.category in segmentColors ? `#${segmentColors[segment.category]}` : 'grey';
+		if (savedQuality) {
+			const qualityBandwidth = parseInt(savedQuality);
+			const tracks = player.getVariantTracks();
 
-			timeline.appendChild(barDiv);
-			sponsorBlockElements.push(barDiv);
-		});
+			let preferredTrack = tracks.find((track) => track.bandwidth === qualityBandwidth);
+			if (!preferredTrack) {
+				preferredTrack = tracks.reduce((prev, curr) =>
+					Math.abs(curr.bandwidth - qualityBandwidth) < Math.abs(prev.bandwidth - qualityBandwidth)
+						? curr
+						: prev
+				);
+			}
+
+			if (preferredTrack) {
+				player.selectVariantTrack(preferredTrack, true);
+			}
+		}
 	}
 
 	function loadTimeFromUrl(page: Page): boolean {
 		if (player) {
 			const timeGivenUrl = page.url.searchParams.get('time');
 			if (timeGivenUrl && !isNaN(parseFloat(timeGivenUrl))) {
-				player.currentTime = Number(timeGivenUrl);
+				playerElement.currentTime = Number(timeGivenUrl);
 				return true;
 			}
 		}
@@ -130,88 +114,234 @@
 
 	page.subscribe((pageUpdate) => loadTimeFromUrl(pageUpdate));
 
-	let initStoreSilence = true;
-	silenceSkipperStore.subscribe((value) => {
-		if (initStoreSilence) {
-			initStoreSilence = false;
-			return;
-		}
-
-		if (typeof silenceSkipperInterval !== 'undefined') {
-			clearInterval(silenceSkipperInterval);
-		}
-
-		if (value) {
-			initSilenceSkipper();
-		}
-	});
-
 	const proxyVideos = get(playerProxyVideosStore);
 
-	function fastForwardToSound(
-		videoElement: HTMLAudioElement,
-		threshold: number = 0.01,
-		checkInterval: number = 100,
-		fastForwardRate: number = 4
-	): void {
-		if (!(videoElement instanceof HTMLMediaElement)) {
-			console.error('Provided element is not a valid HTMLMediaElement');
+	onMount(async () => {
+		shaka.polyfill.installAll();
+		if (!shaka.Player.isBrowserSupported()) {
 			return;
 		}
 
-		const audioContext = new AudioContext();
-		const source = audioContext.createMediaElementSource(videoElement);
-		const analyser = audioContext.createAnalyser();
+		player = new shaka.Player();
+		playerElement = document.getElementById('player') as HTMLMediaElement;
 
-		source.connect(analyser);
-		analyser.connect(audioContext.destination);
-		analyser.fftSize = 256;
+		// Change instantly to stop video from being loud for a second
+		const savedVolume = localStorage.getItem(STORAGE_KEY_VOLUME);
+		if (savedVolume) {
+			playerElement.volume = parseFloat(savedVolume);
+		}
 
-		const dataArray = new Uint8Array(analyser.frequencyBinCount);
+		await player.attach(playerElement);
+		shakaUi = new shaka.ui.Overlay(
+			player,
+			document.getElementById('shaka-container') as HTMLElement,
+			playerElement
+		);
 
-		const checkForSound = () => {
-			analyser.getByteFrequencyData(dataArray);
+		shakaUi.configure({
+			controlPanelElements: [
+				'play_pause',
+				Capacitor.getPlatform() === 'android' ? '' : 'volume',
+				'spacer',
+				'chapter',
+				'time_and_duration',
+				'captions',
+				'overflow_menu',
+				'fullscreen'
+			],
+			overflowMenuButtons: [
+				'cast',
+				'airplay',
+				'captions',
+				'quality',
+				'playback_rate',
+				'loop',
+				'language',
+				Capacitor.getPlatform() === 'android' ? '' : 'save_video_frame',
+				'statistics'
+			],
+			enableTooltips: true
+		});
 
-			const averageVolume = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-			const volume = averageVolume / 255;
+		player.configure({
+			streaming: {
+				bufferingGoal: data.video.ytJsVideoInfo
+					? (data.video.ytJsVideoInfo.page[0].player_config?.media_common_config
+							.dynamic_readahead_config.max_read_ahead_media_time_ms || 0) / 1000
+					: 180,
+				rebufferingGoal: data.video.ytJsVideoInfo
+					? (data.video.ytJsVideoInfo.page[0].player_config?.media_common_config
+							.dynamic_readahead_config.read_ahead_growth_rate_ms || 0) / 1000
+					: 0.02,
+				bufferBehind: 300,
+				autoLowLatencyMode: true
+			},
 
-			if (volume < threshold) {
-				if (!silenceIsFastForwarding) {
-					videoElement.playbackRate = fastForwardRate;
-					silenceIsFastForwarding = true;
+			abr: {
+				enabled: true,
+				restrictToElementSize: true,
+				restrictions: {
+					maxBandwidth: data.video.ytJsVideoInfo
+						? Number(
+								data.video.ytJsVideoInfo.page[0].player_config?.stream_selection_config.max_bitrate
+							)
+						: null
 				}
-			} else {
-				if (silenceIsFastForwarding) {
-					videoElement.playbackRate = userVideoSpeed;
-					silenceIsFastForwarding = false;
+			},
+			preferredDecodingAttributes: !data.video.hlsUrl ? ['smooth', 'powerEfficient'] : [],
+			autoShowText: shaka.config.AutoShowText.NEVER
+		});
+
+		if (data.video.fallbackPatch === 'youtubejs') {
+			const networkingEngine = player.getNetworkingEngine();
+
+			if (!networkingEngine) return;
+
+			// Based off the following
+			// https://github.com/FreeTubeApp/FreeTube/blob/d270c9e251a433f1e4246a3f6a37acef707d22aa/src/renderer/components/ft-shaka-video-player/ft-shaka-video-player.js#L1206
+			// https://github.com/LuanRT/BgUtils/blob/6b121166be1ccb0b952dee1bdac488808365ae6b/examples/browser/web/src/main.ts#L293
+
+			networkingEngine.registerRequestFilter(async (type, request) => {
+				if (type === shaka.net.NetworkingEngine.RequestType.SEGMENT) {
+					const url = new URL(request.uris[0]);
+
+					if (url.hostname.endsWith('.googlevideo.com') && url.pathname === '/videoplayback') {
+						if (request.headers.Range) {
+							url.searchParams.set('range', request.headers.Range.split('=')[1]);
+							url.searchParams.set('ump', '1');
+							url.searchParams.set('srfvp', '1');
+
+							const cachedPoToken = get(poTokenCacheStore);
+							if (cachedPoToken) url.searchParams.set('pot', cachedPoToken);
+
+							delete request.headers.Range;
+						}
+
+						request.method = 'POST';
+						request.body = new Uint8Array([120, 0]);
+					}
+
+					request.uris[0] = url.toString();
 				}
-			}
-		};
+			});
 
-		silenceSkipperInterval = setInterval(checkForSound, checkInterval);
-	}
+			networkingEngine.registerResponseFilter(async (type, response) => {
+				let mediaData = new Uint8Array(0);
 
-	function initSilenceSkipper() {
-		const videoContainer = document.getElementById('video') as HTMLElement;
-		const videoElement = videoContainer.querySelector('video') as HTMLMediaElement;
+				const handleRedirect = async (redirectData: Protos.SabrRedirect) => {
+					const redirectRequest = shaka.net.NetworkingEngine.makeRequest(
+						[redirectData.url!],
+						player!.getConfiguration().streaming.retryParameters
+					);
+					const requestOperation = player!.getNetworkingEngine()!.request(type, redirectRequest);
+					const redirectResponse = await requestOperation.promise;
 
-		fastForwardToSound(videoElement);
-	}
+					response.data = redirectResponse.data;
+					response.headers = redirectResponse.headers;
+					response.uri = redirectResponse.uri;
+				};
 
-	onMount(async () => {
+				const handleMediaData = async (data: Uint8Array) => {
+					const combinedLength = mediaData.length + data.length;
+					const tempMediaData = new Uint8Array(combinedLength);
+
+					tempMediaData.set(mediaData);
+					tempMediaData.set(data, mediaData.length);
+
+					mediaData = tempMediaData;
+				};
+
+				if (type == shaka.net.NetworkingEngine.RequestType.SEGMENT) {
+					const url = new URL(response.uri);
+
+					// Fix positioning for auto-generated subtitles
+					if (
+						url.hostname.endsWith('.youtube.com') &&
+						url.pathname === '/api/timedtext' &&
+						url.searchParams.get('caps') === 'asr' &&
+						url.searchParams.get('kind') === 'asr' &&
+						url.searchParams.get('fmt') === 'vtt'
+					) {
+						const stringBody = new TextDecoder().decode(response.data);
+						// position:0% for LTR text and position:100% for RTL text
+						const cleaned = stringBody.replaceAll(/ align:start position:(?:10)?0%$/gm, '');
+
+						response.data = new TextEncoder().encode(cleaned).buffer as ArrayBuffer;
+					} else {
+						const googUmp = new GoogleVideo.UMP(
+							new GoogleVideo.ChunkedDataBuffer([new Uint8Array(response.data as ArrayBuffer)])
+						);
+
+						let redirect: Protos.SabrRedirect | undefined;
+
+						googUmp.parse((part) => {
+							try {
+								const data = part.data.chunks[0];
+								switch (part.type) {
+									case 20: {
+										const mediaHeader = Protos.MediaHeader.decode(data);
+										console.info('[MediaHeader]:', mediaHeader);
+										break;
+									}
+									case 21: {
+										handleMediaData(part.data.split(1).remainingBuffer.chunks[0]);
+										break;
+									}
+									case 43: {
+										redirect = Protos.SabrRedirect.decode(data);
+										console.info('[SABRRedirect]:', redirect);
+										break;
+									}
+									case 58: {
+										const streamProtectionStatus = Protos.StreamProtectionStatus.decode(data);
+										switch (streamProtectionStatus.status) {
+											case 1:
+												console.info('[StreamProtectionStatus]: Ok');
+												break;
+											case 2:
+												console.error('[StreamProtectionStatus]: Attestation pending');
+												break;
+											case 3:
+												console.error('[StreamProtectionStatus]: Attestation required');
+												break;
+											default:
+												break;
+										}
+										break;
+									}
+								}
+							} catch (error) {
+								console.error('An error occurred while processing the part:', error);
+							}
+						});
+
+						if (redirect) return handleRedirect(redirect);
+
+						if (mediaData.length) response.data = mediaData;
+					}
+				}
+			});
+		}
+
 		if (!data.video.hlsUrl) {
-			playerIsLive = false;
+			let dashUrl = data.video.dashUrl;
+
+			if (!data.video.fallbackPatch && (!Capacitor.isNativePlatform() || proxyVideos)) {
+				dashUrl += '?local=true';
+			}
+
+			await player.load(dashUrl);
+
 			if (data.video.captions) {
 				data.video.captions.forEach(async (caption) => {
-					player.textTracks.add({
-						label: caption.label,
-						kind: 'captions',
-						language: caption.language_code,
-						// Need if captions are generated when youtube.js is being used.
-						src: caption.url.startsWith('http')
-							? caption.url
-							: `${get(instanceStore)}${caption.url}`
-					});
+					player.addTextTrackAsync(
+						caption.url.startsWith('http') ? caption.url : `${get(instanceStore)}${caption.url}`,
+						caption.language_code,
+						'captions',
+						undefined,
+						undefined,
+						caption.label
+					);
 				});
 			}
 
@@ -233,76 +363,15 @@
 				});
 
 				if (timestampIndex > 0) {
-					player.textTracks.add({
-						kind: 'chapters',
-						src: URL.createObjectURL(new Blob([chapterWebVTT])),
-						default: true
-					});
+					player.addChaptersTrack(
+						URL.createObjectURL(new Blob([chapterWebVTT])),
+						get(playerDefaultLanguage)
+					);
 				}
 			}
 
 			// Auto save watch progress every minute.
 			watchProgressTimeout = setInterval(() => savePlayerPos(), 60000);
-
-			player.addEventListener('pause', () => {
-				savePlayerPos();
-				if (get(silenceSkipperStore)) {
-					clearInterval(silenceSkipperInterval);
-				}
-			});
-
-			player.addEventListener('end', () => {
-				savePlayerPos();
-				if (get(silenceSkipperStore)) {
-					clearInterval(silenceSkipperInterval);
-				}
-			});
-
-			player.addEventListener('play', () => {
-				if (get(silenceSkipperStore)) {
-					initSilenceSkipper();
-				}
-			});
-
-			player.addEventListener('seeked', () => {
-				if (get(silenceSkipperStore)) {
-					clearInterval(silenceSkipperInterval);
-
-					initSilenceSkipper();
-				}
-			});
-
-			player.addEventListener('rate-change', () => {
-				if (silenceIsFastForwarding) return;
-				userVideoSpeed = player.playbackRate;
-			});
-
-			player.addEventListener('provider-change', (event) => {
-				const provider = event.detail as any;
-				if (provider?.type === 'dash') {
-					const bitrate = pullBitratePreference();
-					const instanceDefaultBitrate = import.meta.env.VITE_DEFAULT_DASH_BITRATE
-						? Number(import.meta.env.VITE_DEFAULT_DASH_BITRATE)
-						: -1;
-					provider.library = () => import('dashjs');
-					provider.config = {
-						streaming: {
-							abr: {
-								ABRStrategy: 'abrBola',
-								movingAverageMethod: 'ewma',
-								autoSwitchBitrate: {
-									video: false,
-									audio: false
-								},
-								initialBitrate: {
-									video: bitrate === -1 ? instanceDefaultBitrate : bitrate,
-									audio: bitrate === -1 ? instanceDefaultBitrate : bitrate
-								}
-							}
-						}
-					};
-				}
-			});
 
 			if (get(sponsorBlockStore) && get(sponsorBlockCategoriesStore)) {
 				const currentCategories = get(sponsorBlockCategoriesStore);
@@ -318,22 +387,16 @@
 							get(sponsorBlockCategoriesStore) as Category[]
 						);
 
-						setSponsorTimeline();
-
-						addEventListener('resize', () => {
-							setSponsorTimeline();
-						});
-
-						player.addEventListener('time-update', (event: MediaTimeUpdateEvent) => {
+						playerElement.addEventListener('timeupdate', () => {
 							segments.forEach((segment) => {
 								if (
-									event.detail.currentTime >= segment.startTime &&
-									event.detail.currentTime <= segment.endTime
+									playerElement.currentTime >= segment.startTime &&
+									playerElement.currentTime <= segment.endTime
 								) {
-									if (Math.round(player.currentTime) >= Math.round(player.duration)) {
+									if (Math.round(playerElement.currentTime) >= Math.round(playerElement.duration)) {
 										return;
 									}
-									player.currentTime = segment.endTime + 1;
+									playerElement.currentTime = segment.endTime + 1;
 									if (!get(sponsorBlockDisplayToastStore)) {
 										snackBarAlert = `${get(_)('skipping')} ${segment.category}`;
 										ui('#snackbar-alert');
@@ -345,35 +408,7 @@
 				}
 			}
 
-			src = [{ src: data.video.dashUrl, type: 'application/dash+xml' }];
-
-			if (!data.video.fallbackPatch) {
-				if (!Capacitor.isNativePlatform() || proxyVideos) {
-					(src[0] as { src: string }).src += '?local=true';
-				}
-			}
-
-			player.addEventListener('dash-can-play', async () => {
-				await loadPlayerPos();
-
-				const defaultLanguage = get(playerDefaultLanguage);
-				if (defaultLanguage) {
-					let trackIndex = 0;
-					for (const track of player.audioTracks) {
-						console.log(player.audioTracks);
-						if (track.label.toLowerCase().includes(defaultLanguage)) {
-							player.remoteControl.changeAudioTrack(trackIndex);
-							break;
-						}
-						trackIndex++;
-					}
-				}
-
-				if (get(playerAutoPlayStore)) {
-					player.play();
-					player.exitFullscreen();
-				}
-			});
+			await loadPlayerPos();
 
 			if (Capacitor.getPlatform() === 'android' && data.video.adaptiveFormats.length > 0) {
 				const videoFormats = data.video.adaptiveFormats.filter((format) =>
@@ -382,8 +417,10 @@
 
 				originalOrigination = await ScreenOrientation.orientation();
 
-				player.addEventListener('fullscreen-change', async (event: FullscreenChangeEvent) => {
-					if (event.detail) {
+				document.addEventListener('fullscreenchange', async () => {
+					const isFullScreen = !!document.fullscreenElement;
+
+					if (isFullScreen) {
 						// Ensure bar color is black while in fullscreen
 						await StatusBar.setBackgroundColor({ color: '#000000' });
 						await NavigationBar.setColor({
@@ -396,7 +433,7 @@
 
 					if (!get(playerAndroidLockOrientation)) return;
 
-					if (event.detail && videoFormats[0].resolution) {
+					if (isFullScreen && videoFormats[0].resolution) {
 						const widthHeight = videoFormats[0].resolution.split('x');
 
 						if (widthHeight.length !== 2) return;
@@ -419,105 +456,100 @@
 						});
 					}
 				});
-
-				if (data.video.fallbackPatch === undefined && get(playerAndroidBgPlayer)) {
-					const highestBitrateAudio = data.video.adaptiveFormats
-						.filter((format) => format.type.startsWith('audio/'))
-						.reduce((prev, current) => {
-							return parseInt(prev.bitrate) > parseInt(current.bitrate) ? prev : current;
-						});
-
-					const audioId = { audioId: data.video.videoId };
-
-					let isPlayingInBackground = false;
-
-					await AudioPlayer.create({
-						...audioId,
-						audioSource: !data.video.fallbackPatch
-							? proxyVideoUrl(highestBitrateAudio.url)
-							: highestBitrateAudio.url,
-						friendlyTitle: data.video.title,
-						useForNotification: true,
-						loop: player.loop,
-						isBackgroundMusic: false
-					});
-
-					AudioPlayer.onAppGainsFocus(audioId, async () => {
-						if (!isPlayingInBackground) return;
-
-						isPlayingInBackground = false;
-
-						await AudioPlayer.pause(audioId);
-
-						const audioPlayerTime = await AudioPlayer.getCurrentTime(audioId);
-
-						const audioPlayerTimeRounded = Math.round(audioPlayerTime.currentTime);
-						if (audioPlayerTimeRounded > player.currentTime) {
-							player.currentTime = audioPlayerTimeRounded;
-						}
-
-						await player.play();
-					});
-
-					AudioPlayer.onAppLosesFocus(audioId, async () => {
-						if (player.paused) return;
-
-						isPlayingInBackground = true;
-						await AudioPlayer.play(audioId);
-						await AudioPlayer.seek({
-							...audioId,
-							timeInSeconds: Math.round(player.currentTime)
-						});
-					});
-
-					await AudioPlayer.initialize(audioId);
-				}
 			}
 		} else {
-			playerIsLive = true;
-			src = [
-				{
-					src: data.video.hlsUrl + '?local=true',
-					type: 'application/x-mpegurl'
-				}
-			];
+			await player.load(data.video.hlsUrl + '?local=true');
 		}
-
-		player.storage = 'video-player';
-
-		const currentTheme = await getDynamicTheme();
 
 		if (data.video.fallbackPatch === 'youtubejs') {
 			snackBarAlert = get(_)('player.youtubeJsFallBack');
 			ui('#snackbar-alert');
 		}
 
-		document.documentElement.style.setProperty(
-			'--media-slider-track-fill-bg',
-			currentTheme['--primary']
-		);
-		document.documentElement.style.setProperty('--media-menu-bg', currentTheme['--background']);
-		document.documentElement.style.setProperty(
-			'--media-menu-top-bar-bg',
-			currentTheme['--surface']
-		);
-		document.documentElement.style.setProperty(
-			'--media-menu-text-color',
-			currentTheme['--on-background']
-		);
-		document.documentElement.style.setProperty(
-			'--media-menu-item-info-color',
-			currentTheme['--on-background']
-		);
-		document.documentElement.style.setProperty(
-			'--media-menu-section-bg',
-			currentTheme['--surface']
-		);
-		document.documentElement.style.setProperty(
-			'--media-menu-surface-container',
-			currentTheme['--surface']
-		);
-		document.documentElement.style.setProperty('--audio-bg', currentTheme['--surface']);
+		player.addEventListener('buffering', saveQualityPreference);
+		playerElement.addEventListener('volumechange', saveVolumePreference);
+
+		player.addEventListener('loaded', () => {
+			restoreQualityPreference();
+
+			const defaultLanguage = get(playerDefaultLanguage);
+			if (defaultLanguage) {
+				const audioLanguages = player.getAudioLanguages();
+				const langCode = ISO6391.getCode(defaultLanguage);
+
+				for (const audioLanguage of audioLanguages) {
+					if (audioLanguage.startsWith(langCode)) {
+						player.selectAudioLanguage(audioLanguage);
+						break;
+					}
+				}
+			}
+		});
+
+		const overflowMenuButton = document.querySelector('.shaka-overflow-menu-button');
+		if (overflowMenuButton) {
+			overflowMenuButton.innerHTML = 'settings';
+		}
+
+		const backToOverflowButton = document.querySelector('.shaka-back-to-overflow-button');
+		if (backToOverflowButton) {
+			backToOverflowButton.innerHTML = 'arrow_back_ios_new';
+		}
+
+		Mousetrap.bind('space', () => {
+			if (playerElement.paused) {
+				playerElement.play();
+			} else {
+				playerElement.pause();
+			}
+			return false;
+		});
+
+		Mousetrap.bind('right', () => {
+			playerElement.currentTime = playerElement.currentTime + 10;
+			return false;
+		});
+
+		Mousetrap.bind('left', () => {
+			playerElement.currentTime = playerElement.currentTime - 10;
+			return false;
+		});
+
+		Mousetrap.bind('c', () => {
+			const isVisible = player.isTextTrackVisible();
+			if (isVisible) {
+				player.setTextTrackVisibility(false);
+			} else {
+				const defaultLanguage = get(playerDefaultLanguage);
+				const langCode = ISO6391.getCode(defaultLanguage);
+
+				const tracks = player.getTextTracks();
+				const subtitleTrack = tracks.find((track) => track.language === langCode);
+
+				if (subtitleTrack) {
+					player.selectTextTrack(subtitleTrack);
+					player.setTextTrackVisibility(true);
+				}
+			}
+			return false;
+		});
+
+		Mousetrap.bind('f', () => {
+			if (document.fullscreenElement) {
+				document.exitFullscreen();
+			} else {
+				playerElement.requestFullscreen();
+			}
+			return false;
+		});
+
+		Mousetrap.bind('shift+left', () => {
+			playerElement.playbackRate = playerElement.playbackRate - 0.25;
+		});
+
+		Mousetrap.bind('shift+right', () => {
+			playerElement.playbackRate = playerElement.playbackRate + 0.25;
+		});
 	});
 
 	async function loadPlayerPos() {
@@ -543,20 +575,23 @@
 			}
 		}
 
-		if (toSetTime > 0) player.currentTime = toSetTime;
+		if (toSetTime > 0) playerElement.currentTime = toSetTime;
 	}
 
 	function savePlayerPos() {
 		if (data.video.hlsUrl) return;
 
-		if (get(playerSavePlaybackPositionStore) && player && player.currentTime) {
-			if (player.currentTime < player.duration - 10 && player.currentTime > 10) {
+		if (get(playerSavePlaybackPositionStore) && player && playerElement.currentTime) {
+			if (
+				playerElement.currentTime < playerElement.duration - 10 &&
+				playerElement.currentTime > 10
+			) {
 				try {
-					localStorage.setItem(`v_${data.video.videoId}`, player.currentTime.toString());
+					localStorage.setItem(`v_${data.video.videoId}`, playerElement.currentTime.toString());
 				} catch {}
 
 				if (get(synciousStore) && get(synciousInstanceStore) && get(authStore)) {
-					saveVideoProgress(data.video.videoId, player.currentTime);
+					saveVideoProgress(data.video.videoId, playerElement.currentTime);
 				}
 			} else {
 				try {
@@ -572,8 +607,6 @@
 
 	onDestroy(async () => {
 		if (Capacitor.getPlatform() === 'android') {
-			await AudioPlayer.destroy({ audioId: data.video.videoId });
-
 			if (originalOrigination) {
 				await StatusBar.setOverlaysWebView({ overlay: false });
 				await StatusBar.show();
@@ -582,50 +615,33 @@
 				});
 			}
 		}
-		if (typeof silenceSkipperInterval !== 'undefined') {
-			clearInterval(silenceSkipperInterval);
-		}
 		if (watchProgressTimeout) {
 			clearTimeout(watchProgressTimeout);
 		}
 		try {
 			savePlayerPos();
 		} catch (error) {}
-		await player.pause();
-		player.destroy();
+		await playerElement.pause();
+		await player.destroy();
+		await shakaUi.destroy();
 		playerPosSet = false;
 	});
 </script>
 
-{#if audioMode}
-	<div style="margin-top: 40vh;"></div>
-{/if}
-
-<media-player
-	bind:this={player}
-	id="video"
-	autoPlay={$playerAutoPlayStore && !isSyncing}
-	loop={$playerAlwaysLoopStore}
-	title={data.video.title}
-	streamType={playerIsLive ? 'live' : 'on-demand'}
-	viewType={audioMode ? 'audio' : 'video'}
-	keep-alive
-	{src}
+<div
+	id="shaka-container"
+	class="youtube-theme"
+	style="max-height: 80vh; max-width: calc(80vh * 16 / 9); overflow: hidden; position: relative; flex: 1; background-color: black;"
+	data-shaka-player-container
 >
-	<media-provider>
-		{#if !audioMode}
-			<media-poster class="vds-poster" src={getBestThumbnail(data.video.videoThumbnails, 1251, 781)}
-			></media-poster>
-		{/if}
-	</media-provider>
-	<media-audio-layout></media-audio-layout>
-	{#if data.video.storyboards && data.video.storyboards.length > 3}
-		<media-video-layout thumbnails={`${get(instanceStore)}${data.video.storyboards[3].url}`}
-		></media-video-layout>
-	{:else}
-		<media-video-layout></media-video-layout>
-	{/if}
-</media-player>
+	<video
+		controls={false}
+		autoplay={$playerAutoPlayStore}
+		id="player"
+		style="width: 100%; height: 100%; object-fit: contain;"
+		poster={getBestThumbnail(data.video.videoThumbnails, 1251, 781)}
+	></video>
+</div>
 
 {#if !isEmbed}
 	<div class="snackbar" id="snackbar-alert">

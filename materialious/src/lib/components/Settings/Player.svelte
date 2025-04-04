@@ -6,18 +6,15 @@
 	import { get } from 'svelte/store';
 	import {
 		playerAlwaysLoopStore,
-		playerAndroidBgPlayer,
 		playerAndroidLockOrientation,
 		playerAutoPlayStore,
 		playerAutoplayNextByDefaultStore,
 		playerDefaultLanguage,
-		playerListenByDefaultStore,
 		playerProxyVideosStore,
 		playerSavePlaybackPositionStore,
 		playerTheatreModeByDefaultStore,
 		playerYouTubeJsAlways,
-		playerYouTubeJsFallback,
-		silenceSkipperStore
+		playerYouTubeJsFallback
 	} from '../../store';
 
 	let defaultLanguage = $state(get(playerDefaultLanguage));
@@ -80,22 +77,6 @@
 	<div class="field no-margin">
 		<nav class="no-padding">
 			<div class="max">
-				<div>{$_('layout.player.backgroundPlay')}</div>
-			</div>
-			<label class="switch">
-				<input
-					type="checkbox"
-					bind:checked={$playerAndroidBgPlayer}
-					onclick={() => playerAndroidBgPlayer.set(!$playerAndroidBgPlayer)}
-				/>
-				<span></span>
-			</label>
-		</nav>
-	</div>
-
-	<div class="field no-margin">
-		<nav class="no-padding">
-			<div class="max">
 				<div>{$_('layout.player.lockOrientation')}</div>
 			</div>
 			<label class="switch">
@@ -144,22 +125,6 @@
 	</nav>
 </div>
 
-<div class="field no-margin">
-	<nav class="no-padding">
-		<div class="max">
-			<div>{$_('layout.player.listenByDefault')}</div>
-		</div>
-		<label class="switch">
-			<input
-				type="checkbox"
-				bind:checked={$playerListenByDefaultStore}
-				onclick={() => playerListenByDefaultStore.set(!$playerListenByDefaultStore)}
-			/>
-			<span></span>
-		</label>
-	</nav>
-</div>
-
 <div class="field no-margin m l">
 	<nav class="no-padding">
 		<div class="max">
@@ -186,22 +151,6 @@
 				type="checkbox"
 				bind:checked={$playerAutoplayNextByDefaultStore}
 				onclick={() => playerAutoplayNextByDefaultStore.set(!$playerAutoplayNextByDefaultStore)}
-			/>
-			<span></span>
-		</label>
-	</nav>
-</div>
-
-<div class="field no-margin">
-	<nav class="no-padding">
-		<div class="max">
-			<div>{$_('layout.player.silenceSkipper')}</div>
-		</div>
-		<label class="switch">
-			<input
-				type="checkbox"
-				bind:checked={$silenceSkipperStore}
-				onclick={() => silenceSkipperStore.set(!$silenceSkipperStore)}
 			/>
 			<span></span>
 		</label>

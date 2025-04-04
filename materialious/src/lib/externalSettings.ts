@@ -18,14 +18,12 @@ import {
 	playerAutoPlayStore,
 	playerAutoplayNextByDefaultStore,
 	playerDefaultLanguage,
-	playerListenByDefaultStore,
 	playerProxyVideosStore,
 	playerSavePlaybackPositionStore,
 	playerTheatreModeByDefaultStore,
 	returnYTDislikesInstanceStore,
 	returnYtDislikesStore,
 	showWarningStore,
-	silenceSkipperStore,
 	sponsorBlockCategoriesStore,
 	sponsorBlockDisplayToastStore,
 	sponsorBlockStore,
@@ -65,11 +63,6 @@ const persistedStores: { name: string, store: Writable<any>, type: 'string' | 'b
 	{
 		name: 'proxyVideos',
 		store: playerProxyVideosStore,
-		type: 'boolean'
-	},
-	{
-		name: 'listenByDefault',
-		store: playerListenByDefaultStore,
 		type: 'boolean'
 	},
 	{
@@ -165,11 +158,6 @@ const persistedStores: { name: string, store: Writable<any>, type: 'string' | 'b
 	{
 		name: 'sponsorBlockDisplayToast',
 		store: sponsorBlockDisplayToastStore,
-		type: 'boolean'
-	},
-	{
-		name: 'silenceSkipper',
-		store: silenceSkipperStore,
 		type: 'boolean'
 	},
 	{

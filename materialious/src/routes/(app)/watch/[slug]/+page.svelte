@@ -1,6 +1,4 @@
 <script lang="ts">
-	import { run } from 'svelte/legacy';
-
 	import { goto } from '$app/navigation';
 	import {
 		addPlaylistVideo,
@@ -20,7 +18,7 @@
 	import { getBestThumbnail, proxyGoogleImage } from '$lib/images';
 	import { letterCase } from '$lib/letterCasing';
 	import { truncate, unsafeRandomItem } from '$lib/misc';
-	import type { PlayerEvents } from '$lib/player';
+	import type { PlayerEvents } from '$lib/player.js';
 	import {
 		activePageStore,
 		authStore,
@@ -28,7 +26,6 @@
 		interfaceAutoExpandDesc,
 		interfaceLowBandwidthMode,
 		playerAutoplayNextByDefaultStore,
-		playerListenByDefaultStore,
 		playerTheatreModeByDefaultStore,
 		playlistSettingsStore,
 		syncPartyConnectionsStore,
@@ -41,10 +38,10 @@
 	import { onDestroy, onMount, tick } from 'svelte';
 	import { _ } from 'svelte-i18n';
 	import { get } from 'svelte/store';
-	import type { MediaTimeUpdateEvent } from 'vidstack';
-	import type { MediaPlayerElement } from 'vidstack/elements';
 
 	let { data = $bindable() } = $props();
+
+	let playerElement: HTMLMediaElement;
 
 	let comments: Comments | null = $state(null);
 	data.streamed.comments?.then((streamedComments) => {
@@ -69,9 +66,6 @@
 
 	let theatreMode = $state(get(playerTheatreModeByDefaultStore));
 
-	let audioMode = $state(get(playerListenByDefaultStore));
-	let player: MediaPlayerElement;
-
 	let segments: Segment[] = $state([]);
 
 	let pauseTimerSeconds: number = $state(-1);
@@ -79,14 +73,13 @@
 	let showTranscript = $state(false);
 
 	let playerCurrentTime: number = $state(0);
-	// @ts-ignore
-	run(() => {
-		if (typeof player !== 'undefined') {
-			playerCurrentTime = player.currentTime;
-			player.addEventListener(
-				'time-update',
-				(event: MediaTimeUpdateEvent) => (playerCurrentTime = event.detail.currentTime)
-			);
+
+	$effect(() => {
+		if ($interfaceAutoExpandComments && comments) {
+			const commentSectionElement = document.getElementById('comment-section');
+			if (commentSectionElement) {
+				commentSectionElement.click();
+			}
 		}
 	});
 
@@ -99,9 +92,9 @@
 	});
 
 	function playerSyncEvents(conn: DataConnection) {
-		if (player) {
+		if (playerElement) {
 			conn.send({
-				events: [{ type: 'seek', time: player.currentTime }]
+				events: [{ type: 'seek', time: playerElement.currentTime }]
 			} as PlayerEvents);
 		}
 
@@ -120,17 +113,17 @@
 			const events = rawData as PlayerEvents;
 
 			events.events.forEach(async (event) => {
-				if (!player) return;
+				if (!playerElement) return;
 
 				if (event.type === 'pause') {
-					player.pause();
+					playerElement.pause();
 				} else if (event.type === 'play') {
-					player.play();
+					playerElement.play();
 				} else if (event.type === 'seek' && event.time) {
-					const timeDiff = player.currentTime - event.time;
+					const timeDiff = playerElement.currentTime - event.time;
 
 					if (timeDiff > 5 || timeDiff < -5) {
-						player.currentTime = event.time;
+						playerElement.currentTime = event.time;
 					}
 				} else if (
 					event.type === 'playlist' &&
@@ -144,9 +137,24 @@
 			});
 		});
 
-		if (!player) return;
+		if (!playerElement) return;
 
-		player.addEventListener('auto-play-fail', () => {
+		playerElement.addEventListener('error', () => {
+			if (!playerElement) return;
+			conn.send({
+				events: [
+					{
+						type: 'seek',
+						time: playerElement.currentTime
+					},
+					{
+						type: 'play'
+					}
+				]
+			} as PlayerEvents);
+		});
+
+		playerElement.addEventListener('pause', () => {
 			conn.send({
 				events: [
 					{
@@ -156,13 +164,13 @@
 			} as PlayerEvents);
 		});
 
-		player.addEventListener('auto-play', () => {
-			if (!player) return;
+		playerElement.addEventListener('playing', () => {
+			if (!playerElement) return;
 			conn.send({
 				events: [
 					{
 						type: 'seek',
-						time: player.currentTime
+						time: playerElement.currentTime
 					},
 					{
 						type: 'play'
@@ -171,7 +179,22 @@
 			} as PlayerEvents);
 		});
 
-		player.addEventListener('pause', () => {
+		playerElement.addEventListener('play', () => {
+			if (!playerElement) return;
+			conn.send({
+				events: [
+					{
+						type: 'seek',
+						time: playerElement.currentTime
+					},
+					{
+						type: 'play'
+					}
+				]
+			} as PlayerEvents);
+		});
+
+		playerElement.addEventListener('waiting', () => {
 			conn.send({
 				events: [
 					{
@@ -181,53 +204,13 @@
 			} as PlayerEvents);
 		});
 
-		player.addEventListener('playing', () => {
-			if (!player) return;
+		playerElement.addEventListener('seeked', () => {
+			if (!playerElement) return;
 			conn.send({
 				events: [
 					{
 						type: 'seek',
-						time: player.currentTime
-					},
-					{
-						type: 'play'
-					}
-				]
-			} as PlayerEvents);
-		});
-
-		player.addEventListener('play', () => {
-			if (!player) return;
-			conn.send({
-				events: [
-					{
-						type: 'seek',
-						time: player.currentTime
-					},
-					{
-						type: 'play'
-					}
-				]
-			} as PlayerEvents);
-		});
-
-		player.addEventListener('waiting', () => {
-			conn.send({
-				events: [
-					{
-						type: 'pause'
-					}
-				]
-			} as PlayerEvents);
-		});
-
-		player.addEventListener('seeked', () => {
-			if (!player) return;
-			conn.send({
-				events: [
-					{
-						type: 'seek',
-						time: player.currentTime
+						time: playerElement.currentTime
 					}
 				]
 			} as PlayerEvents);
@@ -235,19 +218,30 @@
 	}
 
 	syncPartyConnectionsStore.subscribe((connections) => {
-		if (!connections || !player) return;
+		if (!connections || !playerElement) return;
 		playerSyncEvents(connections[connections.length - 1]);
 	});
 
 	onMount(async () => {
+		if ($interfaceAutoExpandDesc) {
+			const descriptionElement = document.getElementById('description');
+			if (descriptionElement) {
+				descriptionElement.click();
+			}
+		}
+
 		if ($syncPartyConnectionsStore) {
 			$syncPartyConnectionsStore.forEach((conn) => {
 				playerSyncEvents(conn);
 			});
 		}
 
-		if (player) {
-			player.addEventListener('end', async () => {
+		if (playerElement) {
+			playerElement.addEventListener('timeupdate', () => {
+				playerCurrentTime = playerElement.currentTime;
+			});
+
+			playerElement.addEventListener('end', async () => {
 				if (playlistVideos.length === 0) {
 					if ($playerAutoplayNextByDefaultStore) {
 						goto(`/watch/${data.video.recommendedVideos[0].videoId}`);
@@ -404,7 +398,7 @@
 			clearTimeout(pauseTimeout);
 		}
 		pauseTimeout = setTimeout(() => {
-			player.pause();
+			// player.pause();
 			pauseTimerSeconds = 0;
 			clearTimeout(pauseTimeout);
 		}, pauseTimerSeconds * 1000);
@@ -426,17 +420,7 @@
 	<div class={`s12 m12 l${theatreMode ? '12' : '9'}`}>
 		<div style="display: flex;justify-content: center;">
 			{#key data.video.videoId}
-				<div
-					style="max-height: 80vh;max-width: calc(80vh * 16 / 9);overflow: hidden;position: relative;flex: 1;"
-				>
-					<Player
-						bind:segments
-						{data}
-						{audioMode}
-						isSyncing={$syncPartyPeerStore !== null}
-						bind:player
-					/>
-				</div>
+				<Player bind:playerElement bind:segments {data} isSyncing={$syncPartyPeerStore !== null} />
 			{/key}
 		</div>
 
@@ -516,10 +500,6 @@
 				{/await}
 
 				<div>
-					<button onclick={() => (audioMode = !audioMode)} class:border={!audioMode}>
-						<i>headphones</i>
-						<div class="tooltip">{$_('player.audioOnly')}</div>
-					</button>
 					<button onclick={toggleTheatreMode} class="m l" class:border={!theatreMode}>
 						<i>width_wide</i>
 						<div class="tooltip">{$_('player.theatreMode')}</div>
@@ -563,8 +543,8 @@
 							<div class="tooltip">{$_('player.addToPlaylist')}</div>
 							<menu class="no-wrap mobile">
 								{#each personalPlaylists as personalPlaylist}
-									<a
-										href="#add"
+									<button
+										class="row"
 										onclick={async () => await toggleVideoToPlaylist(personalPlaylist.playlistId)}
 									>
 										<nav>
@@ -577,7 +557,7 @@
 												<i>add</i>
 											{/if}
 										</nav>
-									</a>
+									</button>
 								{/each}
 							</menu>
 						</button>
@@ -598,8 +578,8 @@
 		</div>
 
 		<article>
-			<details open={$interfaceAutoExpandDesc}>
-				<summary class="bold none">
+			<details>
+				<summary id="description" class="bold none">
 					<nav>
 						<div class="max">
 							{numberWithCommas(data.video.viewCount)} views • {data.video.publishedText}
@@ -616,7 +596,9 @@
 						{#if data.content.timestamps.length > 0}
 							<h6 style="margin-bottom: .3em;">Chapters</h6>
 							{#each data.content.timestamps as timestamp}
-								<button onclick={() => (player.currentTime = timestamp.time)} class="timestamps"
+								<button
+									onclick={() => (playerElement.currentTime = timestamp.time)}
+									class="timestamps"
 									>{timestamp.timePretty}
 									{#if !timestamp.title.startsWith('-')}
 										-
@@ -640,8 +622,8 @@
 
 		{#if comments && comments.comments.length > 0}
 			<article>
-				<details open={$interfaceAutoExpandComments}>
-					<summary class="none bold">
+				<details>
+					<summary id="comment-section" class="none bold">
 						<nav>
 							<div class="max">{numberWithCommas(comments.commentCount)} comments</div>
 							<i>expand_more</i>
@@ -665,7 +647,7 @@
 	{#if !theatreMode}
 		<div class="s12 m12 l3">
 			{#if showTranscript}
-				<Transcript bind:player video={data.video} />
+				<Transcript video={data.video} bind:playerElement />
 			{/if}
 			{#if playlist}
 				<article
